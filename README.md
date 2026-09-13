@@ -94,10 +94,20 @@ alone. GitHub refuses them on a user-owned repo with HTTP 422, and the whole
 branch protection request fails.
 
 `gh-reposync` asks GitHub what owns each repo rather than comparing it with
-`org`, so a personal manifest whose `org` is your own username works too. On a
-user-owned repo it sends `restrictions: null` and `block_creations: false`,
-says it skipped them, and checks `block_creations` against `false`. Every other
-setting and protection is applied the same way to both.
+`org`, so a personal manifest whose `org` is your own username works too. If
+GitHub cannot answer, the run stops rather than guess, because treating an
+organization as a user would strip its push restrictions. On a user-owned repo
+it sends `restrictions: null` and `block_creations: false`, says it skipped
+them, and checks both against those values. On an organization repo `--check`
+compares `restrictions` too. Every other setting and protection is applied the
+same way to both.
+
+### What `--apply` prints
+
+`--apply` runs the matching check before each part and writes only what has
+drifted. `OK` means it already matched and nothing was written. `APPLIED` means
+it wrote, and the lines after it say what differed. A failed write stops the
+run with the error, never with a silent exit.
 
 ## ⚙️ What gets synced
 

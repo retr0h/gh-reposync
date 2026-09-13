@@ -18,11 +18,14 @@
 #   3. ./repos.json
 #   4. ./.github/repos.json
 #
-# A repo entry may optionally set "owner" to override the default org —
-# used for external-user-owned repos (e.g. retr0h/tlock) managed
-# alongside a GitHub org. When owner != org, branch-protection
-# restrictions are forced to null (user-owned repos cannot have team
-# or user restrictions).
+# A repo entry may optionally set "owner" to override the default org,
+# for user-owned repos (e.g. retr0h/tlock) managed alongside a GitHub org.
+# gh-reposync asks GitHub whether each owner is a user or an organization.
+# Push restrictions and block_creations exist on organization repos only,
+# so a user-owned repo gets none, and a run that cannot find out stops.
+#
+# --apply checks each part first and writes only what has drifted: OK means
+# nothing was written, APPLIED means it was, followed by what differed.
 #
 # Requirements: gh (the GitHub CLI), jq
 
@@ -81,12 +84,41 @@ resolve_owner() {
 
 # owner_type echoes what GitHub says owns a repo: "User" or "Organization".
 #
-# Asked rather than inferred from the manifest. An owner that matches `.org` is
-# not necessarily an organization: a personal manifest names the user there,
-# and a push restriction on a user-owned repo is refused with HTTP 422.
+# Asked rather than inferred from the manifest, because an owner that matches
+# `.org` is not necessarily an organization. Never guessed: treating an
+# organization as a user would strip its push restrictions, and --check would
+# then call that correct. Anything but a clear answer stops the run.
+#
+# Call it as an assignment at the top level. Inside $(...) in a condition, the
+# die would end only the subshell and the run would carry on.
 owner_type() {
-  local owner="$1"
-  gh api "users/${owner}" --jq '.type' 2>/dev/null || echo "Unknown"
+  local owner="$1" type
+  type=$(gh api "users/${owner}" --jq '.type') \
+    || die "could not ask GitHub whether ${owner} is a user or an organization"
+  case "$type" in
+    User | Organization) echo "$type" ;;
+    *) die "GitHub did not say whether ${owner} is a user or an organization: ${type}" ;;
+  esac
+}
+
+# apply_step writes one part of a repo's config only if it has drifted.
+#
+# The matching check runs first. When it reports OK or SKIP, that report is
+# printed and nothing is written, so APPLIED always means something changed,
+# and the drift lines after it say what.
+apply_step() {
+  local step="$1"
+  shift
+  local report
+  report=$("check_${step}" "$@") || true
+  case "$report" in
+    *": OK" | *": SKIP"*)
+      echo "$report"
+      return
+      ;;
+  esac
+  "apply_${step}" "$@"
+  printf '%s\n' "$report" | grep '^  - ' || true
 }
 
 # --- Parse args -------------------------------------------------------------
@@ -225,27 +257,35 @@ check_security() {
   local repo="$1" owner="$2"
   local drifts=()
 
-  # Vulnerability alerts (Dependabot alerts)
-  local desired_alerts
-  desired_alerts=$(jq -r '.security.vulnerability_alerts' "$CONFIG")
-  if gh api "repos/${owner}/${repo}/vulnerability-alerts" >/dev/null 2>&1; then
-    [[ "$desired_alerts" != "true" ]] && drifts+=("  - vulnerability_alerts: actual=true, desired=${desired_alerts}")
-  else
-    [[ "$desired_alerts" != "false" ]] && drifts+=("  - vulnerability_alerts: actual=false, desired=${desired_alerts}")
-  fi
-
-  # Dependabot security updates, secret scanning, push protection
+  # Read the repo first. The alerts endpoint answers 404 both when alerts are
+  # off and when the repo cannot be read, so a 404 means off only once the
+  # repo itself has answered.
   local actual
   actual=$(gh api "repos/${owner}/${repo}" --jq '.security_and_analysis' 2>/dev/null) \
     || { echo "  [$repo] security: ERROR (could not fetch)"; DRIFT=1; return; }
 
-  local key api_key
+  # Vulnerability alerts (Dependabot alerts): 204 on, 404 off, anything else
+  # is not an answer.
+  local desired_alerts alerts_status actual_alerts
+  desired_alerts=$(jq -r '.security.vulnerability_alerts' "$CONFIG")
+  alerts_status=$(gh api -i "repos/${owner}/${repo}/vulnerability-alerts" 2>/dev/null | head -1 | awk '{print $2}') || true
+  case "$alerts_status" in
+    204) actual_alerts=true ;;
+    404) actual_alerts=false ;;
+    *)
+      echo "  [$repo] security: ERROR (could not read vulnerability alerts: HTTP ${alerts_status:-no answer})"
+      DRIFT=1
+      return
+      ;;
+  esac
+  [[ "$actual_alerts" != "$desired_alerts" ]] && drifts+=("  - vulnerability_alerts: actual=${actual_alerts}, desired=${desired_alerts}")
+
+  # Dependabot security updates, secret scanning, push protection
+  local key
   for key in dependabot_security_updates secret_scanning secret_scanning_push_protection; do
     local desired actual_val
     desired=$(jq -r --arg k "$key" '.security[$k]' "$CONFIG")
-    api_key="$key"
-    [[ "$key" == "secret_scanning_push_protection" ]] && api_key="secret_scanning_push_protection"
-    actual_val=$(echo "$actual" | jq -r --arg k "$api_key" '.[$k].status // "disabled"')
+    actual_val=$(echo "$actual" | jq -r --arg k "$key" '.[$k].status // "disabled"')
     local desired_status="disabled"
     [[ "$desired" == "true" ]] && desired_status="enabled"
     if [[ "$actual_val" != "$desired_status" ]]; then
@@ -268,10 +308,14 @@ apply_security() {
   # Vulnerability alerts
   local desired_alerts
   desired_alerts=$(jq -r '.security.vulnerability_alerts' "$CONFIG")
+  # Errors are not silenced. Under set -e a hidden failure here used to end
+  # the whole run with no message.
   if [[ "$desired_alerts" == "true" ]]; then
-    gh api "repos/${owner}/${repo}/vulnerability-alerts" -X PUT >/dev/null 2>&1
+    gh api "repos/${owner}/${repo}/vulnerability-alerts" -X PUT >/dev/null \
+      || die "could not enable vulnerability alerts on ${owner}/${repo}"
   else
-    gh api "repos/${owner}/${repo}/vulnerability-alerts" -X DELETE >/dev/null 2>&1
+    gh api "repos/${owner}/${repo}/vulnerability-alerts" -X DELETE >/dev/null \
+      || die "could not disable vulnerability alerts on ${owner}/${repo}"
   fi
 
   # Dependabot security updates, secret scanning, push protection
@@ -295,7 +339,7 @@ apply_security() {
 # --- Branch protection ------------------------------------------------------
 
 check_branch_protection() {
-  local repo="$1" owner="$2"
+  local repo="$1" owner="$2" otype="$3"
   local branch
   branch=$(jq -r '.branch_protection.branch' "$CONFIG")
 
@@ -358,9 +402,25 @@ check_branch_protection() {
   # have it off, and that is what it is checked against.
   local desired_block actual_block
   desired_block=$(jq -r '.branch_protection.block_creations' "$CONFIG")
-  [[ "$(owner_type "$owner")" != "Organization" ]] && desired_block="false"
+  [[ "$otype" != "Organization" ]] && desired_block="false"
   actual_block=$(_bp_enabled '.block_creations.enabled')
   [[ "$actual_block" != "$desired_block" ]] && drifts+=("  - block_creations: actual=${actual_block}, desired=${desired_block}")
+
+  # restrictions: who may push. Organization-only, so a user-owned repo can
+  # only ever have none. Compared as sorted logins and slugs, which is what the
+  # manifest names and what GitHub returns under the full objects.
+  local desired_restrict actual_restrict
+  if [[ "$otype" == "Organization" ]]; then
+    desired_restrict=$(jq -c '.branch_protection.restrictions
+      | if . == null then null
+        else {users: ((.users // []) | sort), teams: ((.teams // []) | sort), apps: ((.apps // []) | sort)} end' "$CONFIG")
+  else
+    desired_restrict="null"
+  fi
+  actual_restrict=$(echo "$actual" | jq -c '.restrictions
+    | if . == null then null
+      else {users: ([.users[].login] | sort), teams: ([.teams[].slug] | sort), apps: ([.apps[].slug] | sort)} end')
+  [[ "$actual_restrict" != "$desired_restrict" ]] && drifts+=("  - restrictions: actual=${actual_restrict}, desired=${desired_restrict}")
 
   if [[ ${#drifts[@]} -eq 0 ]]; then
     echo "  [$repo] branch_protection: OK"
@@ -372,7 +432,7 @@ check_branch_protection() {
 }
 
 apply_branch_protection() {
-  local repo="$1" owner="$2"
+  local repo="$1" owner="$2" otype="$3"
   local branch
   branch=$(jq -r '.branch_protection.branch' "$CONFIG")
 
@@ -390,7 +450,7 @@ apply_branch_protection() {
   # on organization repos alone. A user-owned repo gets null and false so every
   # other protection still applies, whatever the manifest's `.org` says.
   local restrictions
-  if [[ "$(owner_type "$owner")" == "Organization" ]]; then
+  if [[ "$otype" == "Organization" ]]; then
     restrictions=$(jq -c '.branch_protection.restrictions' "$CONFIG")
   else
     restrictions="null"
@@ -435,6 +495,8 @@ apply_branch_protection() {
 echo ""
 for repo in $REPOS; do
   owner=$(resolve_owner "$repo")
+  # At the top level, so a failure to find out stops the run.
+  otype=$(owner_type "$owner")
   if [[ "$owner" == "$ORG" ]]; then
     echo "[$repo]"
   else
@@ -446,13 +508,13 @@ for repo in $REPOS; do
     check_description        "$repo" "$owner"
     check_topics             "$repo" "$owner"
     check_security           "$repo" "$owner"
-    check_branch_protection  "$repo" "$owner"
+    check_branch_protection  "$repo" "$owner" "$otype"
   else
-    apply_settings           "$repo" "$owner"
-    apply_description        "$repo" "$owner"
-    apply_topics             "$repo" "$owner"
-    apply_security           "$repo" "$owner"
-    apply_branch_protection  "$repo" "$owner"
+    apply_step settings           "$repo" "$owner"
+    apply_step description        "$repo" "$owner"
+    apply_step topics             "$repo" "$owner"
+    apply_step security           "$repo" "$owner"
+    apply_step branch_protection  "$repo" "$owner" "$otype"
   fi
 
   echo ""
