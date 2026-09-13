@@ -79,6 +79,16 @@ resolve_owner() {
   echo "$owner"
 }
 
+# owner_type echoes what GitHub says owns a repo: "User" or "Organization".
+#
+# Asked rather than inferred from the manifest. An owner that matches `.org` is
+# not necessarily an organization: a personal manifest names the user there,
+# and a push restriction on a user-owned repo is refused with HTTP 422.
+owner_type() {
+  local owner="$1"
+  gh api "users/${owner}" --jq '.type' 2>/dev/null || echo "Unknown"
+}
+
 # --- Parse args -------------------------------------------------------------
 
 MODE=""
@@ -344,9 +354,11 @@ check_branch_protection() {
   actual_del=$(_bp_enabled '.allow_deletions.enabled')
   [[ "$actual_del" != "$desired_del" ]] && drifts+=("  - allow_deletions: actual=${actual_del}, desired=${desired_del}")
 
-  # block_creations
+  # block_creations. Organization-only, so a user-owned repo can only ever
+  # have it off, and that is what it is checked against.
   local desired_block actual_block
   desired_block=$(jq -r '.branch_protection.block_creations' "$CONFIG")
+  [[ "$(owner_type "$owner")" != "Organization" ]] && desired_block="false"
   actual_block=$(_bp_enabled '.block_creations.enabled')
   [[ "$actual_block" != "$desired_block" ]] && drifts+=("  - block_creations: actual=${actual_block}, desired=${desired_block}")
 
@@ -374,14 +386,18 @@ apply_branch_protection() {
   desired_del=$(jq -r '.branch_protection.allow_deletions' "$CONFIG")
   desired_block=$(jq -r '.branch_protection.block_creations' "$CONFIG")
 
-  # User-owned repos (owner != org) cannot set team/user restrictions on
-  # branch protection — those are org-only features. Pass null so the
-  # remaining protections still apply.
+  # Push restrictions, and block_creations which only works with them, exist
+  # on organization repos alone. A user-owned repo gets null and false so every
+  # other protection still applies, whatever the manifest's `.org` says.
   local restrictions
-  if [[ "$owner" == "$ORG" ]]; then
+  if [[ "$(owner_type "$owner")" == "Organization" ]]; then
     restrictions=$(jq -c '.branch_protection.restrictions' "$CONFIG")
   else
     restrictions="null"
+    if [[ "$desired_block" == "true" || "$(jq -c '.branch_protection.restrictions' "$CONFIG")" != "null" ]]; then
+      echo "  [$repo] branch_protection: restrictions and block_creations are organization-only, skipped for user-owned ${owner}"
+    fi
+    desired_block="false"
   fi
 
   local payload

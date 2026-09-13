@@ -86,12 +86,18 @@ complete example. The schema in brief:
 }
 ```
 
-### ⚠️ Cross-owner limitations
+### ⚠️ User-owned repos
 
-When a repo's `owner` doesn't match the top-level `org`, branch
-protection `restrictions` (team/user allowlists) cannot be set —
-those are org-only features. `gh-reposync` forces `restrictions` to
-`null` for such repos automatically.
+Branch protection `restrictions` (team and user push allowlists) and
+`block_creations`, which only works with them, exist on organization repos
+alone. GitHub refuses them on a user-owned repo with HTTP 422, and the whole
+branch protection request fails.
+
+`gh-reposync` asks GitHub what owns each repo rather than comparing it with
+`org`, so a personal manifest whose `org` is your own username works too. On a
+user-owned repo it sends `restrictions: null` and `block_creations: false`,
+says it skipped them, and checks `block_creations` against `false`. Every other
+setting and protection is applied the same way to both.
 
 ## ⚙️ What gets synced
 
