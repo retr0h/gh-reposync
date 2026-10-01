@@ -17,7 +17,8 @@ in line. `--check` reports drift without mutating anything.
   desired and exits non-zero when anything is off, so CI can gate PRs
   that forget to update the manifest
 - 🛡️ **Covers the boring bits** — repo settings, description, topics,
-  Dependabot / secret scanning / push protection, branch protection
+  Dependabot / secret scanning / push protection, branch protection,
+  and whether you are watching the repo at all
 - 🌐 **Cross-owner repos** — per-repo `"owner"` override lets a single
   manifest manage personal repos alongside an org's (e.g. the
   org's `example-org/*` plus your personal `you/*` mixed into one
