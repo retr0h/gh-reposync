@@ -336,6 +336,63 @@ apply_security() {
   echo "  [$repo] security: APPLIED"
 }
 
+# --- Subscription -----------------------------------------------------------
+
+# Whether you are watching the repo. A repo nobody watches sends no
+# notifications, so its Dependabot and code scanning alerts never reach an
+# inbox even though the alerts themselves are enabled. Nothing in the UI tells
+# you this: the repo simply has no subscription record, which reads the same as
+# a repo you have never touched.
+
+check_subscription() {
+  local repo="$1" owner="$2"
+
+  local desired
+  desired=$(jq -r '.subscription.watching // empty' "$CONFIG")
+  [[ -z "$desired" ]] && return
+
+  # 404 means no subscription record, which is the not-watching case. Any other
+  # failure is not an answer.
+  local status actual
+  status=$(gh api -i "repos/${owner}/${repo}/subscription" 2>/dev/null | head -1 | awk '{print $2}') || true
+  case "$status" in
+    200)
+      actual=$(gh api "repos/${owner}/${repo}/subscription" --jq 'if .ignored then "ignored" else (.subscribed|tostring) end' 2>/dev/null)
+      ;;
+    404) actual=false ;;
+    *)
+      echo "  [$repo] subscription: ERROR (could not read: HTTP ${status:-no answer})"
+      DRIFT=1
+      return
+      ;;
+  esac
+
+  if [[ "$actual" == "$desired" ]]; then
+    echo "  [$repo] subscription: OK"
+  else
+    echo "  [$repo] subscription: DRIFT"
+    echo "  - watching: actual=${actual}, desired=${desired}"
+    DRIFT=1
+  fi
+}
+
+apply_subscription() {
+  local repo="$1" owner="$2"
+
+  local desired
+  desired=$(jq -r '.subscription.watching // empty' "$CONFIG")
+  [[ -z "$desired" ]] && return
+
+  if [[ "$desired" == "true" ]]; then
+    # -F, not -f. The endpoint rejects the string "true" with a 422, and -f
+    # sends every value as a string.
+    gh api -X PUT "repos/${owner}/${repo}/subscription" -F subscribed=true -F ignored=false >/dev/null       || die "could not watch ${owner}/${repo}"
+  else
+    gh api -X DELETE "repos/${owner}/${repo}/subscription" >/dev/null       || die "could not unwatch ${owner}/${repo}"
+  fi
+  echo "  [$repo] subscription: APPLIED"
+}
+
 # --- Branch protection ------------------------------------------------------
 
 check_branch_protection() {
@@ -508,12 +565,14 @@ for repo in $REPOS; do
     check_description        "$repo" "$owner"
     check_topics             "$repo" "$owner"
     check_security           "$repo" "$owner"
+    check_subscription       "$repo" "$owner"
     check_branch_protection  "$repo" "$owner" "$otype"
   else
     apply_step settings           "$repo" "$owner"
     apply_step description        "$repo" "$owner"
     apply_step topics             "$repo" "$owner"
     apply_step security           "$repo" "$owner"
+    apply_step subscription       "$repo" "$owner"
     apply_step branch_protection  "$repo" "$owner" "$otype"
   fi
 
